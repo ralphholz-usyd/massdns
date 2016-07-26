@@ -41,6 +41,7 @@ void print_help(char *file)
                     "Usage: %s [options] domainlist (- for stdin) \n"
                     "  -a  --no-authority     Omit records from the authority section of the response packets.\n"
                     "  -c  --resolve-count    Number of resolves for a name before giving up. (Default: 50)\n"
+                    "   --servfail-retries    Number of retries for SERVFAIL replies. \n"
                     "  -e  --additional       Include response records within the additional section.\n"
                     "  -h  --help             Show this help.\n"
                     "  -i  --interval         Interval in milliseconds to wait between multiple resolves of the same"
@@ -133,11 +134,13 @@ typedef struct dns_stats_t
 dns_stats_t stats;
 
 unsigned int * timeout_stats;
+unsigned int * servfail_stats;
 
 typedef struct lookup
 {
     char *domain;
     unsigned char tries;
+    unsigned char servfail_tries;
     uint16_t transaction;
     struct timeval next_lookup;
 } lookup_t;
@@ -170,6 +173,7 @@ typedef struct lookup_context
         bool norecurse;
         bool show_progress;
         bool quiet;
+        unsigned int servfail_retries;
     } cmd_args;
 } lookup_context_t;
 
@@ -348,7 +352,11 @@ void print_stats(lookup_context_t *context)
     fprintf(print, "Succeeded queries (only with RR answer): %zu (%.2f%%)\n", stats.answers, total == 0 ? 0 : (float) stats.answers / total * 100);
     fprintf(print, "Succeeded queries (includes empty answer): %zu (%.2f%%)\n", stats.noerr, total == 0 ? 0 : (float) stats.noerr / total * 100);
     fprintf(print, "Format errors: %zu (%.2f%%)\n", stats.formerr, total == 0 ? 0 : (float) stats.formerr / total * 100);
-    fprintf(print, "SERVFAIL: %zu (%.2f%%)\n", stats.servfail, total == 0 ? 0 : (float) stats.servfail / total * 100);
+    fprintf(print, "Final SERVFAIL: %zu (%.2f%%)\n", stats.servfail, total == 0 ? 0 : (float) stats.servfail / total * 100);
+    for(int i=0;i<context->cmd_args.servfail_retries;i++){
+      fprintf(print, "%u: %u , ",i+1,servfail_stats[i]);//,100*(float)servfail_stats[i]/servfail_stats[0]);
+    }
+    fprintf(print, "\n");
     fprintf(print, "NXDOMAIN: %zu (%.2f%%)\n", stats.nxdomain, total == 0 ? 0 : (float) stats.nxdomain / total * 100);
     fprintf(print, "Final Timeout: %zu (%.2f%%)\n", stats.timeout, total == 0 ? 0 : (float) stats.timeout / (total+stats.timeout * 100));
     for(int i=0;i<context->cmd_args.resolve_count;i++){
@@ -388,6 +396,11 @@ void print_stats_final(lookup_context_t *context)
     for(int i=0;i<context->cmd_args.resolve_count;i++){
       fprintf(print, "%u: %u (%.0f%%), ",i+1,timeout_stats[i],100*(float)timeout_stats[i]/timeout_stats[0]);
     }
+    fprintf(print, "\n");
+    for(int i=0;i<context->cmd_args.servfail_retries;i++){
+      fprintf(print, "%u: %u (%.0f%%), ",i+1,servfail_stats[i],100*(float)servfail_stats[i]/servfail_stats[0]);
+    }
+    fprintf(print, "\n");
     fprintf(print, "\n");
     fprintf(print, "DEBUG: FINALSTATS: Refused: %zu (%.2f%%)\n", stats.refused, total == 0 ? 0 : (float) stats.refused / total * 100);
     fprintf(print, "DEBUG: FINALSTATS: Mismatch: %zu (%.2f%%)\n", stats.mismatch, total == 0 ? 0 : (float) stats.mismatch / total * 100);
@@ -429,6 +442,7 @@ void massdns_handle_packet(ldns_pkt *packet, struct sockaddr_storage ns, void *c
         return;
     }
     free(name);
+    unsigned int retry=0;
     switch (response_code)
     {
         case LDNS_RCODE_NOERROR:
@@ -472,8 +486,16 @@ void massdns_handle_packet(ldns_pkt *packet, struct sockaddr_storage ns, void *c
             fprintf(stdout, "ERROR: FORMERR: %s \n", lookup->domain);
             break;
         case LDNS_RCODE_SERVFAIL:
-            stats.servfail++;
+            if(lookup->servfail_tries >= context->cmd_args.servfail_retries)
+            {
+              retry=0;
+              stats.servfail++;
+            } else {
+            retry=1;
+            }
             fprintf(stdout, "ERROR: SERVFAIL: %s \n", lookup->domain);
+            servfail_stats[lookup->servfail_tries]++;
+            lookup->servfail_tries++;
             break;
         case LDNS_RCODE_NXDOMAIN:
             stats.nxdomain++;
@@ -513,10 +535,14 @@ void massdns_handle_packet(ldns_pkt *packet, struct sockaddr_storage ns, void *c
             break;
     }
     context->current_rate++;
-    fprintf(stdout, "DEBUG: Removing %s from hashtable. \n", lookup->domain);
-    hashmapRemove(context->map, lookup->domain);
-    free(lookup->domain);
-    free(lookup);
+    if(retry==0)
+    {
+      fprintf(stdout, "DEBUG: Removing %s from hashtable. \n", lookup->domain);
+      hashmapRemove(context->map, lookup->domain);
+      free(lookup->domain);
+      free(lookup);
+    }
+
 }
 
 int massdns_receive_packet(int socket, void (*handle_packet)(ldns_pkt *, struct sockaddr_storage, void *),
@@ -816,6 +842,7 @@ void massdns_scan(lookup_context_t *context)
                     lookup = safe_malloc(sizeof(*lookup));
                     lookup->domain = value;
                     lookup->tries = 0;
+                    lookup->servfail_tries =0;
                     if (fread(&lookup->transaction, 1, sizeof(lookup->transaction), randomness) !=
                         sizeof(lookup->transaction))
                     {
@@ -874,6 +901,7 @@ int main(int argc, char **argv)
     context->cmd_args.resolve_count = 50;
     context->cmd_args.hashmap_size = 100000;
     context->cmd_args.interval_ms = 200;
+    context->cmd_args.servfail_retries = 0;
     context->cooldown = false;
     context->stdin = false;
     context->total_domains = 0;
@@ -964,6 +992,20 @@ int main(int argc, char **argv)
             context->cmd_args.resolve_count = (unsigned char) atoi(argv[++i]);
             timeout_stats = malloc(sizeof(unsigned int)*context->cmd_args.resolve_count);
             memset(timeout_stats,0,sizeof(unsigned int)*context->cmd_args.resolve_count);
+        }
+        else if (strcmp(argv[i], "--servfail-retries") == 0)
+        {
+          if (i + 1 >= argc || strtol(argv[i + 1], NULL, 10) < 0)
+          {
+              fprintf(stderr, "The servfail retries have to be a valid, non-negative number.\n\n");
+              print_help(argv[0]);
+              return 1;
+          }
+          context->cmd_args.servfail_retries = (size_t) strtol(argv[++i], NULL, 10);
+          fprintf(stdout,"DEBUG: servfail_retries parsed to %u \n",context->cmd_args.servfail_retries);
+          servfail_stats = malloc(sizeof(unsigned int)*context->cmd_args.servfail_retries);
+          memset(servfail_stats,0,sizeof(unsigned int)*context->cmd_args.servfail_retries);
+
         }
         else if (strcmp(argv[i], "--hashmap-size") == 0 || strcmp(argv[i], "-s") == 0)
         {
